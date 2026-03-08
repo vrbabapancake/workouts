@@ -58,11 +58,6 @@ export async function initDb() {
     );
   `);
 
-  await database.execAsync(`
-    CREATE INDEX IF NOT EXISTS idx_exercises_pattern
-      ON exercises(movement_pattern);
-  `);
-
   // Migration: add movement_pattern column if it was missing from an older schema
   const exerciseCols = await database.getAllAsync(`PRAGMA table_info(exercises)`);
   const hasMovementPattern = exerciseCols.some((c) => c.name === 'movement_pattern');
@@ -71,6 +66,11 @@ export async function initDb() {
       ALTER TABLE exercises ADD COLUMN movement_pattern TEXT NOT NULL DEFAULT 'isolation';
     `);
   }
+
+  await database.execAsync(`
+    CREATE INDEX IF NOT EXISTS idx_exercises_pattern
+      ON exercises(movement_pattern);
+  `);
 
   // ── Exercise Equipment join ───────────────────────────────────────────────
   await database.execAsync(`
