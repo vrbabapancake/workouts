@@ -33,27 +33,79 @@ export async function searchExercises(query) {
 // Sessions
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Create a new session and return its id. */
-export async function createSession() {
+/**
+ * Create a new session.
+ * status: 'active' (start now) | 'planned' (plan for later)
+ */
+export async function createSession(status = 'active') {
   const db = await getDb();
   const result = await db.runAsync(
-    `INSERT INTO sessions (started_at) VALUES (datetime('now'))`,
-    []
+    `INSERT INTO sessions (started_at, status)
+     VALUES (CASE WHEN ? = 'active' THEN datetime('now') ELSE NULL END, ?)`,
+    [status, status]
   );
   return result.lastInsertRowId;
 }
 
-/** End a session by setting ended_at. */
+/**
+ * Save the list of exercises for a session (replaces any previous list).
+ * Call this right after createSession or when updating a plan.
+ */
+export async function saveSessionExercises(sessionId, exerciseIds) {
+  const db = await getDb();
+  await db.runAsync(`DELETE FROM session_exercises WHERE session_id = ?`, [sessionId]);
+  for (let i = 0; i < exerciseIds.length; i++) {
+    await db.runAsync(
+      `INSERT OR IGNORE INTO session_exercises (session_id, exercise_id, sort_order) VALUES (?, ?, ?)`,
+      [sessionId, exerciseIds[i], i]
+    );
+  }
+}
+
+/**
+ * Return the exercises saved to a session (from session_exercises table),
+ * ordered by sort_order.
+ */
+export async function getSessionPlan(sessionId) {
+  const db = await getDb();
+  return db.getAllAsync(
+    `
+    SELECT e.*
+    FROM session_exercises se
+    JOIN exercises e ON e.id = se.exercise_id
+    WHERE se.session_id = ?
+    ORDER BY se.sort_order
+    `,
+    [sessionId]
+  );
+}
+
+/** Start a planned session — sets status to active and records the start time. */
+export async function startPlannedSession(sessionId) {
+  const db = await getDb();
+  await db.runAsync(
+    `UPDATE sessions SET status = 'active', started_at = datetime('now') WHERE id = ?`,
+    [sessionId]
+  );
+}
+
+/** End a session — marks it as completed. */
 export async function endSession(sessionId, notes = null) {
   const db = await getDb();
   await db.runAsync(
-    `UPDATE sessions SET ended_at = datetime('now'), notes = ? WHERE id = ?`,
+    `UPDATE sessions SET ended_at = datetime('now'), status = 'completed', notes = ? WHERE id = ?`,
     [notes, sessionId]
   );
 }
 
-/** Return recent sessions (default 10) with a set count. */
-export async function getRecentSessions(limit = 10) {
+/** Delete a session and all its sets (cascades via foreign key). */
+export async function deleteSession(sessionId) {
+  const db = await getDb();
+  await db.runAsync(`DELETE FROM sessions WHERE id = ?`, [sessionId]);
+}
+
+/** Return recent active/completed sessions with set counts. */
+export async function getRecentSessions(limit = 20) {
   const db = await getDb();
   return db.getAllAsync(
     `
@@ -62,15 +114,38 @@ export async function getRecentSessions(limit = 10) {
       s.started_at,
       s.ended_at,
       s.notes,
+      s.status,
       COUNT(DISTINCT st.exercise_id) AS exercise_count,
       COUNT(st.id)                   AS set_count
     FROM sessions s
     LEFT JOIN sets st ON st.session_id = s.id
+    WHERE s.status IN ('active', 'completed')
     GROUP BY s.id
     ORDER BY s.started_at DESC
     LIMIT ?
     `,
     [limit]
+  );
+}
+
+/** Return all planned sessions with their exercise count from session_exercises. */
+export async function getPlannedSessions() {
+  const db = await getDb();
+  return db.getAllAsync(
+    `
+    SELECT
+      s.id,
+      s.started_at,
+      s.ended_at,
+      s.notes,
+      s.status,
+      COUNT(se.id) AS exercise_count
+    FROM sessions s
+    LEFT JOIN session_exercises se ON se.session_id = s.id
+    WHERE s.status = 'planned'
+    GROUP BY s.id
+    ORDER BY s.id DESC
+    `
   );
 }
 
@@ -99,7 +174,7 @@ export async function getSessionSets(sessionId) {
   );
 }
 
-/** Return unique exercises used in a session, ordered by first appearance. */
+/** Return unique exercises used in a session, ordered by first logged set. */
 export async function getSessionExercises(sessionId) {
   const db = await getDb();
   return db.getAllAsync(
@@ -180,21 +255,11 @@ export async function getExerciseSetsInSession(sessionId, exerciseId) {
 // Last Performance
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Return the most recent sets for an exercise (from a prior session),
- * grouped as one "last performance" entry per set number.
- */
 export async function getLastPerformance(exerciseId, currentSessionId = null) {
   const db = await getDb();
 
-  // Find the most recent session (other than current) that includes this exercise
-  const args = currentSessionId
-    ? [exerciseId, currentSessionId]
-    : [exerciseId];
-
-  const whereClause = currentSessionId
-    ? `AND st.session_id != ?`
-    : '';
+  const args = currentSessionId ? [exerciseId, currentSessionId] : [exerciseId];
+  const whereClause = currentSessionId ? `AND st.session_id != ?` : '';
 
   const lastSession = await db.getFirstAsync(
     `
@@ -216,10 +281,6 @@ export async function getLastPerformance(exerciseId, currentSessionId = null) {
   );
 }
 
-/**
- * Return a summary of the last performance: best weight, avg reps, etc.
- * Useful for auto-populating starting values.
- */
 export async function getLastPerformanceSummary(exerciseId, currentSessionId = null) {
   const sets = await getLastPerformance(exerciseId, currentSessionId);
   if (!sets.length) return null;
@@ -313,10 +374,6 @@ export async function getPRs(exerciseId) {
 // Pattern Balance (rolling 2-session window)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Return movement pattern counts for the last N completed sessions.
- * Used to show rolling balance and flag imbalances in the session builder.
- */
 export async function getPatternCountsForLastNSessions(n = 2) {
   const db = await getDb();
   return db.getAllAsync(
@@ -327,10 +384,10 @@ export async function getPatternCountsForLastNSessions(n = 2) {
     FROM sets st
     JOIN exercises e ON e.id = st.exercise_id
     JOIN sessions s  ON s.id = st.session_id
-    WHERE s.ended_at IS NOT NULL
+    WHERE s.status = 'completed'
       AND s.id IN (
         SELECT id FROM sessions
-        WHERE ended_at IS NOT NULL
+        WHERE status = 'completed'
         ORDER BY started_at DESC
         LIMIT ?
       )
@@ -341,23 +398,15 @@ export async function getPatternCountsForLastNSessions(n = 2) {
   );
 }
 
-/**
- * Given the exercises already chosen for the current session-in-planning,
- * compute the combined pattern balance across those + the last (n-1) sessions.
- * Returns an array of { movement_pattern, count, flag } sorted by pattern.
- * flag = 'heavy' | 'light' | 'ok'
- */
 export async function getSessionPatternBalance(selectedExerciseIds) {
   const db = await getDb();
 
-  // Counts from the last 1 completed session
   const historyCounts = await getPatternCountsForLastNSessions(1);
   const historyMap = {};
   for (const row of historyCounts) {
     historyMap[row.movement_pattern] = (historyMap[row.movement_pattern] || 0) + row.exercise_occurrences;
   }
 
-  // Counts for currently selected exercises
   const selectedMap = {};
   for (const id of selectedExerciseIds) {
     const ex = await db.getFirstAsync(
@@ -369,7 +418,6 @@ export async function getSessionPatternBalance(selectedExerciseIds) {
     }
   }
 
-  // Merge
   const allPatterns = new Set([...Object.keys(historyMap), ...Object.keys(selectedMap)]);
   const result = [];
 
@@ -380,7 +428,6 @@ export async function getSessionPatternBalance(selectedExerciseIds) {
 
   result.sort((a, b) => b.count - a.count);
 
-  // Flag patterns: if one pattern has ≥2x another, flag it
   const maxCount = result.length ? result[0].count : 0;
   const minCount = result.length ? result[result.length - 1].count : 0;
 
@@ -394,9 +441,6 @@ export async function getSessionPatternBalance(selectedExerciseIds) {
 // Cooldown Check
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Return true if the exercise is on cooldown (done within the last cooldown_days).
- */
 export async function isExerciseOnCooldown(exerciseId) {
   const db = await getDb();
   const exercise = await db.getFirstAsync(
@@ -411,7 +455,7 @@ export async function isExerciseOnCooldown(exerciseId) {
     FROM sets st
     JOIN sessions s ON s.id = st.session_id
     WHERE st.exercise_id = ?
-      AND s.ended_at IS NOT NULL
+      AND s.status = 'completed'
     ORDER BY st.logged_at DESC
     LIMIT 1
     `,
@@ -426,10 +470,6 @@ export async function isExerciseOnCooldown(exerciseId) {
   return daysSince < exercise.cooldown_days;
 }
 
-/**
- * Return cooldown status for all exercises.
- * Returns array of { exercise_id, on_cooldown, days_since_last }.
- */
 export async function getCooldownStatus() {
   const db = await getDb();
   const exercises = await getAllExercises();
@@ -442,7 +482,7 @@ export async function getCooldownStatus() {
       FROM sets st
       JOIN sessions s ON s.id = st.session_id
       WHERE st.exercise_id = ?
-        AND s.ended_at IS NOT NULL
+        AND s.status = 'completed'
       ORDER BY st.logged_at DESC
       LIMIT 1
       `,
@@ -468,7 +508,6 @@ export async function getCooldownStatus() {
 // Program / Pool
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Add an exercise to the program pool. */
 export async function addToProgram(exerciseId) {
   const db = await getDb();
   await db.runAsync(
@@ -477,7 +516,6 @@ export async function addToProgram(exerciseId) {
   );
 }
 
-/** Remove an exercise from the program pool. */
 export async function removeFromProgram(exerciseId) {
   const db = await getDb();
   await db.runAsync(
@@ -486,7 +524,6 @@ export async function removeFromProgram(exerciseId) {
   );
 }
 
-/** Return all exercises in the program pool. */
 export async function getProgramExercises() {
   const db = await getDb();
   return db.getAllAsync(
@@ -504,7 +541,6 @@ export async function getProgramExercises() {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Human-readable label for a movement pattern. */
 export function formatPattern(pattern) {
   return pattern
     .split('_')
@@ -512,7 +548,6 @@ export function formatPattern(pattern) {
     .join(' ');
 }
 
-/** Format seconds as mm:ss. */
 export function formatDuration(seconds) {
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;

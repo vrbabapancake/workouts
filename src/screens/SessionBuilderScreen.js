@@ -3,7 +3,6 @@ import {
   View,
   Text,
   StyleSheet,
-  FlatList,
   SectionList,
   TouchableOpacity,
   TextInput,
@@ -14,14 +13,15 @@ import {
 import {
   getAllExercises,
   createSession,
-  logSet,
+  saveSessionExercises,
+  getSessionPlan,
+  startPlannedSession,
   getSessionPatternBalance,
   formatPattern,
 } from '../db/queries';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-// How patterns are grouped for display
 const PATTERN_ORDER = [
   'horizontal_push',
   'horizontal_pull',
@@ -51,14 +51,14 @@ function groupExercisesByPattern(exercises) {
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
-function PatternBalanceBar({ balance, selectedIds }) {
+function PatternBalanceBar({ balance }) {
   if (!balance.length) return null;
 
   const maxCount = Math.max(...balance.map((b) => b.count), 1);
 
   return (
     <View style={styles.balanceContainer}>
-      <Text style={styles.balanceTitle}>Pattern Balance (2-session window)</Text>
+      <Text style={styles.balanceTitle}>Pattern balance (last session + this one)</Text>
       {balance.map((item) => (
         <View key={item.movement_pattern} style={styles.balanceRow}>
           <Text style={styles.balanceLabel} numberOfLines={1}>
@@ -78,7 +78,7 @@ function PatternBalanceBar({ balance, selectedIds }) {
       ))}
       {balance.some((b) => b.flag === 'heavy') && (
         <Text style={styles.balanceWarning}>
-          ⚠ Some patterns are heavily weighted — consider balancing.
+          Some patterns are heavily weighted — consider balancing your workout.
         </Text>
       )}
     </View>
@@ -146,16 +146,29 @@ function SectionHeader({ title }) {
 
 // ── Screen ────────────────────────────────────────────────────────────────────
 
-export default function SessionBuilderScreen({ navigation }) {
+export default function SessionBuilderScreen({ navigation, route }) {
+  // planSessionId is set when editing an existing planned session
+  const planSessionId = route.params?.planSessionId ?? null;
+
   const [exercises, setExercises] = useState([]);
   const [selectedIds, setSelectedIds] = useState([]);
   const [balance, setBalance] = useState([]);
   const [query, setQuery] = useState('');
-  const [starting, setStarting] = useState(false);
+  const [saving, setSaving] = useState(false);
 
+  // Load all exercises
   useEffect(() => {
     getAllExercises().then(setExercises);
   }, []);
+
+  // If editing an existing plan, pre-select those exercises
+  useEffect(() => {
+    if (planSessionId) {
+      getSessionPlan(planSessionId).then((planExercises) => {
+        setSelectedIds(planExercises.map((e) => e.id));
+      });
+    }
+  }, [planSessionId]);
 
   // Refresh balance whenever selection changes
   useEffect(() => {
@@ -170,7 +183,6 @@ export default function SessionBuilderScreen({ navigation }) {
     );
   }, []);
 
-  // Filter by search query
   const filteredExercises = useMemo(() => {
     if (!query.trim()) return exercises;
     const q = query.trim().toLowerCase();
@@ -179,29 +191,63 @@ export default function SessionBuilderScreen({ navigation }) {
 
   const sections = useMemo(() => groupExercisesByPattern(filteredExercises), [filteredExercises]);
 
-  const selectedExercises = useMemo(
-    () => exercises.filter((e) => selectedIds.includes(e.id)),
-    [exercises, selectedIds]
-  );
+  // ── Start Now ──────────────────────────────────────────────────────────────
 
-  const handleStartSession = useCallback(async () => {
+  const handleStartNow = useCallback(async () => {
     if (!selectedIds.length) {
       Alert.alert('No exercises selected', 'Pick at least one exercise to start.');
       return;
     }
-
-    setStarting(true);
+    setSaving(true);
     try {
-      const sessionId = await createSession();
-      navigation.replace('ActiveSession', {
-        sessionId,
-        exerciseIds: selectedIds,
-      });
+      let sessionId;
+
+      if (planSessionId) {
+        // Turn the existing plan into an active session
+        await saveSessionExercises(planSessionId, selectedIds);
+        await startPlannedSession(planSessionId);
+        sessionId = planSessionId;
+      } else {
+        // Brand new session
+        sessionId = await createSession('active');
+        await saveSessionExercises(sessionId, selectedIds);
+      }
+
+      navigation.replace('ActiveSession', { sessionId });
     } catch (e) {
       Alert.alert('Error', e.message);
-      setStarting(false);
+      setSaving(false);
     }
-  }, [selectedIds, navigation]);
+  }, [selectedIds, planSessionId, navigation]);
+
+  // ── Plan for Later ─────────────────────────────────────────────────────────
+
+  const handlePlanForLater = useCallback(async () => {
+    if (!selectedIds.length) {
+      Alert.alert('No exercises selected', 'Pick at least one exercise to save a plan.');
+      return;
+    }
+    setSaving(true);
+    try {
+      let sessionId;
+
+      if (planSessionId) {
+        // Update the existing plan's exercises
+        await saveSessionExercises(planSessionId, selectedIds);
+        sessionId = planSessionId;
+      } else {
+        sessionId = await createSession('planned');
+        await saveSessionExercises(sessionId, selectedIds);
+      }
+
+      navigation.replace('Home');
+    } catch (e) {
+      Alert.alert('Error', e.message);
+      setSaving(false);
+    }
+  }, [selectedIds, planSessionId, navigation]);
+
+  const isEditing = !!planSessionId;
 
   return (
     <View style={styles.container}>
@@ -220,7 +266,7 @@ export default function SessionBuilderScreen({ navigation }) {
 
       {/* Pattern balance indicator */}
       {selectedIds.length > 0 && (
-        <PatternBalanceBar balance={balance} selectedIds={selectedIds} />
+        <PatternBalanceBar balance={balance} />
       )}
 
       {/* Selected count pill */}
@@ -256,16 +302,27 @@ export default function SessionBuilderScreen({ navigation }) {
         }
       />
 
-      {/* Start button */}
+      {/* Footer — two buttons */}
       <View style={styles.footer}>
         <TouchableOpacity
-          style={[styles.startButton, (!selectedIds.length || starting) && styles.startButtonDisabled]}
-          onPress={handleStartSession}
-          disabled={!selectedIds.length || starting}
+          style={[styles.planBtn, (!selectedIds.length || saving) && styles.btnDisabled]}
+          onPress={handlePlanForLater}
+          disabled={!selectedIds.length || saving}
           activeOpacity={0.85}
         >
-          <Text style={styles.startButtonText}>
-            {starting ? 'Starting…' : `Start Session (${selectedIds.length})`}
+          <Text style={styles.planBtnText}>
+            {saving ? 'Saving…' : isEditing ? 'Update Plan' : 'Plan for Later'}
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.startBtn, (!selectedIds.length || saving) && styles.btnDisabled]}
+          onPress={handleStartNow}
+          disabled={!selectedIds.length || saving}
+          activeOpacity={0.85}
+        >
+          <Text style={styles.startBtnText}>
+            {saving ? 'Starting…' : `Start Now (${selectedIds.length})`}
           </Text>
         </TouchableOpacity>
       </View>
@@ -453,7 +510,7 @@ const styles = StyleSheet.create({
 
   // List
   listContent: {
-    paddingBottom: 100,
+    paddingBottom: 130,
   },
   empty: {
     paddingTop: 40,
@@ -464,30 +521,47 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
 
-  // Footer
+  // Footer — two buttons side by side
   footer: {
     position: 'absolute',
     bottom: 0,
     left: 0,
     right: 0,
-    padding: 20,
+    padding: 16,
     paddingBottom: 32,
     backgroundColor: '#111827',
     borderTopWidth: 1,
     borderTopColor: '#1f2937',
+    flexDirection: 'row',
+    gap: 10,
   },
-  startButton: {
-    backgroundColor: '#3b82f6',
+  planBtn: {
+    flex: 1,
+    backgroundColor: '#1e3a5f',
     borderRadius: 14,
-    paddingVertical: 16,
+    paddingVertical: 15,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#1d4ed8',
+  },
+  planBtnText: {
+    color: '#93c5fd',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  startBtn: {
+    flex: 1,
+    backgroundColor: '#065f46',
+    borderRadius: 14,
+    paddingVertical: 15,
     alignItems: 'center',
   },
-  startButtonDisabled: {
-    backgroundColor: '#1f2937',
-  },
-  startButtonText: {
-    color: '#fff',
-    fontSize: 17,
+  startBtnText: {
+    color: '#34d399',
+    fontSize: 15,
     fontWeight: '700',
+  },
+  btnDisabled: {
+    opacity: 0.4,
   },
 });

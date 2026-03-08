@@ -13,7 +13,7 @@ import {
 } from 'react-native';
 
 import {
-  getExerciseById,
+  getSessionPlan,
   getExerciseSetsInSession,
   getLastPerformanceSummary,
   logSet,
@@ -32,7 +32,7 @@ const DEFAULT_REST_SECONDS = 90;
 // ─────────────────────────────────────────────────────────────────────────────
 
 function useRestTimer() {
-  const [restRemaining, setRestRemaining] = useState(null); // null = not running
+  const [restRemaining, setRestRemaining] = useState(null);
   const intervalRef = useRef(null);
   const pulseAnim = useRef(new Animated.Value(1)).current;
 
@@ -57,7 +57,6 @@ function useRestTimer() {
     setRestRemaining(null);
   }, []);
 
-  // Pulse animation when ≤ 10 seconds
   useEffect(() => {
     if (restRemaining !== null && restRemaining <= 10 && restRemaining > 0) {
       Animated.sequence([
@@ -94,7 +93,7 @@ function RestTimerBanner({ remaining, onStop, pulseAnim }) {
       <View style={styles.restBannerLeft}>
         <Text style={styles.restBannerLabel}>{isDone ? 'Rest done!' : 'Rest'}</Text>
         <Text style={styles.restBannerTime}>
-          {isDone ? 'Go! 💪' : formatDuration(remaining)}
+          {isDone ? 'Go!' : formatDuration(remaining)}
         </Text>
       </View>
       <TouchableOpacity style={styles.restSkipBtn} onPress={onStop}>
@@ -264,7 +263,6 @@ function ExercisePanel({ exercise, sessionId, onSetLogged, restTimer }) {
   const [lastPerf, setLastPerf] = useState(null);
   const [logging, setLogging] = useState(false);
 
-  // Load existing sets for this exercise in this session + last performance
   useEffect(() => {
     let active = true;
     (async () => {
@@ -275,7 +273,6 @@ function ExercisePanel({ exercise, sessionId, onSetLogged, restTimer }) {
       if (!active) return;
       setLoggedSets(sets);
 
-      // Auto-populate input from last performance
       if (perf) {
         setLastPerf(perf);
         setInputValues((prev) => ({
@@ -315,13 +312,10 @@ function ExercisePanel({ exercise, sessionId, onSetLogged, restTimer }) {
 
       await logSet(payload);
 
-      // Refresh logged sets
       const updated = await getExerciseSetsInSession(sessionId, exercise.id);
       setLoggedSets(updated);
 
-      // Start rest timer automatically
       startRest(DEFAULT_REST_SECONDS);
-
       onSetLogged?.();
     } catch (e) {
       Alert.alert('Error', e.message);
@@ -330,13 +324,34 @@ function ExercisePanel({ exercise, sessionId, onSetLogged, restTimer }) {
     }
   }, [sessionId, exercise, inputValues, loggedSets, startRest, onSetLogged]);
 
+  const trackingLabel = {
+    weighted: 'weighted',
+    timed: 'timed',
+    reps_only: 'reps only',
+  }[exercise.tracking_type] || exercise.tracking_type;
+
   return (
     <View style={styles.exercisePanel}>
-      {/* Exercise name + tracking type */}
+      {/* Name + type */}
       <View style={styles.exercisePanelHeader}>
         <Text style={styles.exercisePanelName}>{exercise.name}</Text>
-        <Text style={styles.exercisePanelType}>{exercise.tracking_type}</Text>
+        <Text style={styles.exercisePanelType}>{trackingLabel}</Text>
       </View>
+
+      {/* Description + form tip */}
+      {(exercise.description || exercise.form_tip) ? (
+        <View style={styles.exerciseMeta}>
+          {exercise.description ? (
+            <Text style={styles.exerciseDesc}>{exercise.description}</Text>
+          ) : null}
+          {exercise.form_tip ? (
+            <View style={styles.formTipRow}>
+              <Text style={styles.formTipLabel}>Form tip  </Text>
+              <Text style={styles.formTipText}>{exercise.form_tip}</Text>
+            </View>
+          ) : null}
+        </View>
+      ) : null}
 
       {/* Last performance */}
       <LastPerformanceCard summary={lastPerf} trackingType={exercise.tracking_type} />
@@ -378,7 +393,7 @@ function ExercisePanel({ exercise, sessionId, onSetLogged, restTimer }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function ActiveSessionScreen({ navigation, route }) {
-  const { sessionId, exerciseIds = [] } = route.params ?? {};
+  const { sessionId } = route.params ?? {};
 
   const [exercises, setExercises] = useState([]);
   const [finishing, setFinishing] = useState(false);
@@ -386,14 +401,15 @@ export default function ActiveSessionScreen({ navigation, route }) {
   const { restRemaining, stopRest, pulseAnim } = restTimer;
 
   useEffect(() => {
-    (async () => {
-      const loaded = await Promise.all(exerciseIds.map((id) => getExerciseById(id)));
-      setExercises(loaded.filter(Boolean));
-    })();
-  }, [exerciseIds]);
+    if (sessionId) {
+      getSessionPlan(sessionId).then((exs) => {
+        setExercises(exs.filter(Boolean));
+      });
+    }
+  }, [sessionId]);
 
   const handleFinish = useCallback(() => {
-    Alert.alert('Finish Session?', 'This will end the session and save all logged sets.', [
+    Alert.alert('Finish Session?', 'This will save all logged sets.', [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Finish',
@@ -422,7 +438,6 @@ export default function ActiveSessionScreen({ navigation, route }) {
 
   return (
     <View style={styles.container}>
-      {/* Rest timer banner — sticky at top */}
       <RestTimerBanner
         remaining={restRemaining}
         onStop={stopRest}
@@ -443,11 +458,9 @@ export default function ActiveSessionScreen({ navigation, route }) {
           />
         ))}
 
-        {/* Spacer so last exercise isn't hidden by footer */}
         <View style={{ height: 100 }} />
       </ScrollView>
 
-      {/* Finish button */}
       <View style={styles.footer}>
         <TouchableOpacity
           style={[styles.finishBtn, finishing && styles.finishBtnDisabled]}
@@ -545,7 +558,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'flex-start',
-    marginBottom: 12,
+    marginBottom: 8,
   },
   exercisePanelName: {
     color: '#f9fafb',
@@ -558,6 +571,32 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginLeft: 8,
     marginTop: 2,
+  },
+
+  // Description + form tip
+  exerciseMeta: {
+    marginBottom: 12,
+    gap: 6,
+  },
+  exerciseDesc: {
+    color: '#9ca3af',
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  formTipRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+  },
+  formTipLabel: {
+    color: '#3b82f6',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  formTipText: {
+    color: '#60a5fa',
+    fontSize: 12,
+    lineHeight: 17,
+    flex: 1,
   },
 
   // Last performance
