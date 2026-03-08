@@ -8,10 +8,32 @@ export async function getDb() {
   return db;
 }
 
+const SCHEMA_VERSION = 1;
+
 export async function initDb() {
   const database = await getDb();
 
   await database.execAsync(`PRAGMA journal_mode = WAL;`);
+  await database.execAsync(`PRAGMA foreign_keys = OFF;`);
+
+  // If schema version doesn't match, drop everything and start fresh
+  const versionRow = await database.getFirstAsync(`PRAGMA user_version`);
+  if (versionRow.user_version !== SCHEMA_VERSION) {
+    await database.execAsync(`
+      DROP TABLE IF EXISTS personal_records;
+      DROP TABLE IF EXISTS sets;
+      DROP TABLE IF EXISTS sessions;
+      DROP TABLE IF EXISTS program_exercises;
+      DROP TABLE IF EXISTS exercise_equipment;
+      DROP TABLE IF EXISTS exercise_modifiers;
+      DROP TABLE IF EXISTS exercises;
+      DROP TABLE IF EXISTS movement_patterns;
+      DROP TABLE IF EXISTS equipment;
+      DROP TABLE IF EXISTS modifiers;
+    `);
+    await database.execAsync(`PRAGMA user_version = ${SCHEMA_VERSION};`);
+  }
+
   await database.execAsync(`PRAGMA foreign_keys = ON;`);
 
   // ── Movement Patterns ─────────────────────────────────────────────────────
@@ -57,15 +79,6 @@ export async function initDb() {
       is_active         INTEGER NOT NULL DEFAULT 1
     );
   `);
-
-  // Migration: add movement_pattern column if it was missing from an older schema
-  const exerciseCols = await database.getAllAsync(`PRAGMA table_info(exercises)`);
-  const hasMovementPattern = exerciseCols.some((c) => c.name === 'movement_pattern');
-  if (!hasMovementPattern) {
-    await database.execAsync(`
-      ALTER TABLE exercises ADD COLUMN movement_pattern TEXT NOT NULL DEFAULT 'isolation';
-    `);
-  }
 
   await database.execAsync(`
     CREATE INDEX IF NOT EXISTS idx_exercises_pattern
